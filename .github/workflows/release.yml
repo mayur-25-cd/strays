@@ -1,0 +1,94 @@
+# Signs, notarizes, and publishes Strays.dmg when you push a tag like `v1.0.0`.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   MACOS_CERT_P12_BASE64  base64 of your "Developer ID Application" .p12
+#                          (base64 -i cert.p12 | pbcopy)
+#   MACOS_CERT_PASSWORD    the .p12 export password
+#   KEYCHAIN_PASSWORD      any throwaway password for the temp CI keychain
+#   DEVELOPER_ID_APP       e.g. "Developer ID Application: Your Name (TEAMID)"
+#   NOTARY_APPLE_ID        your Apple ID email
+#   NOTARY_TEAM_ID         your 10-char Team ID
+#   NOTARY_PASSWORD        an app-specific password (appleid.apple.com)
+name: Release
+
+# Manual only — run from the Actions tab after setting the 7 secrets above.
+# (Local releases via scripts/notarize.sh don't need this.) This intentionally
+# does NOT fire on version tags, so creating a GitHub release never triggers a
+# failing CI run when secrets aren't configured.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to publish, e.g. v1.0.0"
+        required: true
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Import signing certificate
+        env:
+          CERT_B64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PWD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          KC_PWD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$CERT_B64" | base64 --decode > cert.p12
+          security create-keychain -p "$KC_PWD" build.keychain
+          security default-keychain -s build.keychain
+          security list-keychains -d user -s build.keychain login.keychain
+          security unlock-keychain -p "$KC_PWD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import cert.p12 -k build.keychain -P "$CERT_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,/usr/bin/codesign: -s -k "$KC_PWD" build.keychain
+          rm cert.p12
+
+      - name: Build & sign app
+        env:
+          DEVELOPER_ID_APP: ${{ secrets.DEVELOPER_ID_APP }}
+        run: |
+          ./scripts/build-app.sh release
+          codesign --force --options runtime --timestamp \
+            --sign "$DEVELOPER_ID_APP" dist/Strays.app
+          codesign --verify --strict --verbose=2 dist/Strays.app
+
+      - name: Notarize & staple app
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          ditto -c -k --keepParent dist/Strays.app dist/Strays-notarize.zip
+          xcrun notarytool submit dist/Strays-notarize.zip \
+            --apple-id "$NOTARY_APPLE_ID" --team-id "$NOTARY_TEAM_ID" \
+            --password "$NOTARY_PASSWORD" --wait
+          rm dist/Strays-notarize.zip
+          xcrun stapler staple dist/Strays.app
+
+      - name: Package, notarize & staple DMG
+        env:
+          DEVELOPER_ID_APP: ${{ secrets.DEVELOPER_ID_APP }}
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          STAGING="$(mktemp -d)"
+          cp -R dist/Strays.app "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+          hdiutil create -volname "Strays" -srcfolder "$STAGING" -ov -format UDZO dist/Strays.dmg
+          codesign --force --timestamp --sign "$DEVELOPER_ID_APP" dist/Strays.dmg
+          codesign --verify --strict --verbose=2 dist/Strays.dmg
+          xcrun notarytool submit dist/Strays.dmg \
+            --apple-id "$NOTARY_APPLE_ID" --team-id "$NOTARY_TEAM_ID" \
+            --password "$NOTARY_PASSWORD" --wait
+          xcrun stapler staple dist/Strays.dmg
+          echo "sha256 for the cask:"
+          shasum -a 256 dist/Strays.dmg
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          files: dist/Strays.dmg
+          generate_release_notes: true
